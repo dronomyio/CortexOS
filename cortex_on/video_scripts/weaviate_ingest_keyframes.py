@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""
+weaviate_ingest_keyframes.py
+
+Ingest keyframe descriptions (produced by keyframes_describe.py) into Weaviate so you can do
+"visual-only" queries over frame descriptions (e.g., "person walks under blue arches").
+
+Input JSON: qa_clip_keyframes.json (schema produced by keyframes_describe.py)
+Output: Weaviate collection (default: VideoKeyframe) with OpenAI vectorizer on `description`.
+
+Env vars:
+  WEAVIATE_URL        e.g. http://weaviate:8080 (inside compose) or http://localhost:8080 (host)
+  WEAVIATE_API_KEY    (optional; needed for WCS auth)
+  EMBEDDING_MODEL     (optional; default all-MiniLM-L6-v2)
+
+Usage (inside docker):
+  python3 /app/weaviate_ingest_keyframes.py \
+    --json /data/out/qa_clip_keyframes.json \
+    --collection VideoKeyframe \
+    --video-id dQw4w9WgXcQ \
+    --clip-id qa_clip \
+    --openai-model text-embedding-3-small \
+    --dimensions 512
+
+Notes:
+- This indexes *descriptions*, not raw images. It's great for semantic "what is shown" search.
+- If later you want true image similarity search, add an image-embedding vector and store it as
+  a second named vector or separate collection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import weaviate
+from weaviate.classes.config import Configure, Property, DataType
+from weaviate.util import generate_uuid5
+
+
+def connect_weaviate(url: str, api_key: Optional[str], openai_key: Optional[str]):
+    headers = {}
+    if openai_key:
+        headers["X-OpenAI-Api-Key"] = openai_key
+
+    if "localhost" in url or "127.0.0.1" in url:
+        return weaviate.connect_to_local(headers=headers)
+
+    # Docker internal networking (e.g., http://weaviate:8080)
+    if "weaviate:" in url or url.startswith("http://weaviate"):
+        # Parse the URL to extract host and port
+        import re
+        match = re.match(r'https?://([^:]+):(\d+)', url)
+        if match:
+            host, port = match.groups()
+            return weaviate.connect_to_local(
+                host=host,
+                port=int(port),
+                headers=headers,
+            )
+        # Fallback for http://weaviate without port
+        return weaviate.connect_to_local(
+            host="weaviate",
+            port=8080,
+            headers=headers,
+        )
+
+    if api_key:
+        return weaviate.connect_to_weaviate_cloud(
+            cluster_url=url,
+            auth_credentials=weaviate.auth.AuthApiKey(api_key),
+            headers=headers,
+        )
+
+    # Remote without auth (rare) - use connect_to_local with custom host
+    import re
+    match = re.match(r'https?://([^:/]+)(?::(\d+))?', url)
+    if match:
+        host = match.group(1)
+        port = int(match.group(2)) if match.group(2) else (443 if url.startswith("https://") else 80)
+        return weaviate.connect_to_local(
+            host=host,
+            port=port,
+            headers=headers,
+        )
+    
+    # Final fallback
+    return weaviate.connect_to_local(headers=headers)
+
+
+def ensure_collection(client, name: str, dimensions: int):
+    """Create or reuse a keyframe collection with vectorizer=none (local embeddings)."""
+    try:
+        return client.collections.get(name)
+    except Exception:
+        pass
+
+    props = [
+        Property(name="video_id", data_type=DataType.TEXT),
+        Property(name="clip_id", data_type=DataType.TEXT),
+        Property(name="clip_path", data_type=DataType.TEXT),
+
+        Property(name="frame_path", data_type=DataType.TEXT),
+        Property(name="frame_time_s", data_type=DataType.NUMBER),
+        Property(name="absolute_time_s", data_type=DataType.NUMBER),
+
+        Property(name="description", data_type=DataType.TEXT),
+
+        Property(name="phash", data_type=DataType.TEXT),
+        Property(name="cluster_id", data_type=DataType.INT),
+
+        # Helpful for reconstructing an interval around a keyframe
+        Property(name="t1_abs", data_type=DataType.NUMBER),
+        Property(name="t2_abs", data_type=DataType.NUMBER),
+    ]
+
+    return client.collections.create(
+        name=name,
+        vectorizer_config=Configure.Vectorizer.none(),
+        properties=props,
+    )
+
+
+def load_keyframes_json(path: Path) -> Dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if "keyframes" not in data or not isinstance(data["keyframes"], list):
+        raise ValueError("Invalid keyframes JSON: missing 'keyframes' array")
+    if "clip" not in data or not isinstance(data["clip"], dict):
+        raise ValueError("Invalid keyframes JSON: missing 'clip' object")
+    return data
+
+
+def ingest(collection, video_id: str, clip_id: str, data: Dict[str, Any], batch_size: int = 256):
+    """Ingest keyframes using pre-computed CLIP embeddings or generate them on the fly."""
+    clip = data["clip"]
+    clip_path = str(clip.get("clip_path", ""))
+    t1_abs = clip.get("t1_abs", None)
+    t2_abs = clip.get("t2_abs", None)
+
+    kfs = data["keyframes"]
+    if not kfs:
+        print("No keyframes to ingest.")
+        return
+
+    # Check if we have pre-computed CLIP embeddings
+    has_clip_embeddings = any(kf.get("clip_embedding") for kf in kfs)
+    
+    # If no pre-computed embeddings, generate them from images
+    clip_svc = None
+    if not has_clip_embeddings:
+        from clip_embedding_service import get_clip_embedding_service
+        clip_svc = get_clip_embedding_service()
+        print("[ingest] No pre-computed CLIP embeddings found, will generate from images")
+
+    inserted = 0
+    t0 = time.time()
+
+    for kf in kfs:
+        # Get or compute CLIP embedding
+        vec = kf.get("clip_embedding")
+        if vec is None and clip_svc is not None:
+            frame_path = kf.get("frame_path", "")
+            if frame_path and Path(frame_path).exists():
+                vec = clip_svc.embed_image(frame_path)
+            else:
+                # Skip if no embedding and can't generate one
+                print(f"[ingest] Skipping keyframe: no embedding and frame not found: {frame_path}")
+                continue
+        
+        if vec is None:
+            continue
+
+        obj = {
+            "video_id": video_id,
+            "clip_id": clip_id,
+            "clip_path": clip_path,
+
+            "frame_path": str(kf.get("frame_path", "")),
+            "frame_time_s": float(kf.get("frame_time_s", 0.0)),
+            "absolute_time_s": float(kf.get("absolute_time_s", kf.get("frame_time_s", 0.0))),
+
+            "description": str(kf.get("description", "")).strip(),
+
+            "phash": str(kf.get("phash", "")),
+            "cluster_id": int(kf.get("cluster_id", -1)) if kf.get("cluster_id", None) is not None else -1,
+
+            "t1_abs": float(t1_abs) if t1_abs is not None else None,
+            "t2_abs": float(t2_abs) if t2_abs is not None else None,
+        }
+
+        uid = generate_uuid5(
+            f"{obj['video_id']}|{obj.get('clip_id','')}|{obj.get('absolute_time_s','')}|{obj.get('frame_path','')}"
+        )
+        collection.data.insert(properties=obj, uuid=uid, vector=vec)
+        inserted += 1
+
+        if inserted % 50 == 0:
+            dt = time.time() - t0
+            print(f"Inserted {inserted} keyframes in {dt:.1f}s")
+
+    dt = time.time() - t0
+    print(f"Done. Inserted {inserted} keyframes with CLIP embeddings in {dt:.1f}s")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", required=True, help="Path to qa_clip_keyframes.json")
+    ap.add_argument("--collection", default="VideoKeyframe", help="Weaviate collection name")
+    ap.add_argument("--video-id", required=True, help="Video ID (e.g., YouTube ID)")
+    ap.add_argument("--clip-id", default="clip", help="A label for this clip (e.g., qa_clip)")
+    ap.add_argument("--embedding-model", default=None,
+                    help="sentence-transformers model (default: all-MiniLM-L6-v2)")
+    ap.add_argument("--batch-size", type=int, default=256)
+
+    args = ap.parse_args()
+
+    json_path = Path(args.json).expanduser().resolve()
+    if not json_path.exists():
+        print(f"ERROR: JSON not found: {json_path}", file=sys.stderr)
+        sys.exit(2)
+
+    weaviate_url = os.environ.get("WEAVIATE_URL", "http://localhost:8080")
+    weaviate_api_key = os.environ.get("WEAVIATE_API_KEY")
+
+    # Local embeddings — no OpenAI key needed
+    from embedding_service import get_embedding_service
+    svc = get_embedding_service(args.embedding_model)
+
+    client = connect_weaviate(weaviate_url, weaviate_api_key, openai_key=None)
+    try:
+        col = ensure_collection(client, args.collection, svc.dimensions)
+        data = load_keyframes_json(json_path)
+        ingest(col, args.video_id, args.clip_id, data, batch_size=args.batch_size)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

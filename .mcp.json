@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "cortexos": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "mcp.server"
+      ],
+      "cwd": "./cortex_on",
+      "env": {
+        "CORTEXOS_API_URL": "http://localhost:8093"
+      }
+    }
+  }
+}

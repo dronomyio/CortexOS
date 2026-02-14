@@ -1,0 +1,83 @@
+#version: "3.8"
+
+services:
+  # ─── Unit + Integration Tests ──────────────────────────────────────────
+  cortexvid-tests:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: cortexvid-tests
+    volumes:
+      - ./results:/app/tests/results
+    environment:
+      - OPIK_ENABLED=false
+      - X402_ENABLED=false
+      - PYTHONPATH=/app
+    command: >
+      python -m pytest tests/ -v
+      --tb=short
+      --junitxml=/app/tests/results/report.xml
+      -m "not live"
+
+  # ─── Opus Planner Tests Only ───────────────────────────────────────────
+  opus-planner-tests:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: opus-planner-tests
+    environment:
+      - OPIK_ENABLED=false
+      - X402_ENABLED=false
+      - PYTHONPATH=/app
+    command: >
+      python -m pytest tests/ -v
+      --tb=short
+      -k "Opus or Planner or Ingest or Synthesis"
+    profiles:
+      - opus
+
+  # ─── Observability Tests Only ──────────────────────────────────────────
+  observability-tests:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: observability-tests
+    environment:
+      - OPIK_ENABLED=false
+      - X402_ENABLED=false
+      - PYTHONPATH=/app
+    command: >
+      python -m pytest tests/ -v
+      --tb=short
+      -k "Observability or Evaluator or metrics"
+    profiles:
+      - observability
+
+  # ─── With Opik (live tracing) ──────────────────────────────────────────
+  cortexvid-tests-with-opik:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: cortexvid-tests-opik
+    depends_on:
+      - opik
+    environment:
+      - OPIK_ENABLED=true
+      - OPIK_URL_OVERRIDE=http://opik:5173/api
+      - OPIK_PROJECT_NAME=cortexvid-tests
+      - X402_ENABLED=false
+      - PYTHONPATH=/app
+    command: >
+      python -m pytest tests/ -v
+      --tb=short
+      --junitxml=/app/tests/results/report-opik.xml
+    profiles:
+      - opik
+
+  opik:
+    image: comet-ml/opik:latest
+    container_name: cortexvid-opik
+    ports:
+      - "5173:5173"
+    profiles:
+      - opik

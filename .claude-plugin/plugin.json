@@ -1,0 +1,78 @@
+{
+  "name": "cortexos",
+  "version": "2.0.0",
+  "description": "CortexOS — Opus 4.6 Video Intelligence Platform with x402 Micropayments",
+  "agents": [
+    {
+      "name": "opus-planner",
+      "description": "Opus 4.6 dynamic planning — reads transcripts, selects processing strategy",
+      "doc": ".claude-plugin/agents/opus-planner.md"
+    },
+    {
+      "name": "video-ingest",
+      "description": "Video ingestion — yt-dlp download, Whisper transcription, Weaviate indexing",
+      "doc": ".claude-plugin/agents/video-ingest.md"
+    },
+    {
+      "name": "fact-verifier",
+      "description": "Claim extraction + web verification via Parallel.ai + cross-video contradictions",
+      "doc": ".claude-plugin/agents/fact-verifier.md"
+    },
+    {
+      "name": "observability",
+      "description": "Opik tracing for every Opus decision, pipeline metrics, eval framework",
+      "doc": ".claude-plugin/agents/observability.md"
+    },
+    {
+      "name": "agent-autonomy",
+      "description": "Agent loop, autonomous monitoring, alert system",
+      "doc": ".claude-plugin/agents/agent-autonomy.md"
+    }
+  ],
+  "skills": [
+    {
+      "name": "ingest-video",
+      "command": "/ingest-video",
+      "description": "Download → Whisper → Opus plan → CLIP → Weaviate index",
+      "doc": ".claude-plugin/skills/ingest-video/SKILL.md"
+    },
+    {
+      "name": "find-contradictions",
+      "command": "/find-contradictions",
+      "description": "Opus scans all videos → investigative strategy → timestamped evidence",
+      "doc": ".claude-plugin/skills/find-contradictions/SKILL.md"
+    },
+    {
+      "name": "deploy",
+      "command": "/deploy",
+      "description": "docker-compose build → restart → health check → verify Opus active",
+      "doc": ".claude-plugin/skills/deploy/SKILL.md"
+    }
+  ],
+  "hooks": [
+    {
+      "name": "post-edit",
+      "event": "after_edit",
+      "pattern": "cortex_on/**/*.py",
+      "script": ".claude-plugin/hooks/post-edit.sh",
+      "description": "Catches relative imports, syntax errors, auto-runs tests"
+    },
+    {
+      "name": "post-deploy",
+      "event": "after_command",
+      "pattern": "docker-compose",
+      "script": ".claude-plugin/hooks/post-deploy.sh",
+      "description": "Verifies health, Opus planner, agent discovery after deploy"
+    }
+  ],
+  "mcpServers": {
+    "cortexos": {
+      "command": "python3",
+      "args": ["-m", "mcp.server"],
+      "cwd": "./cortex_on",
+      "env": {
+        "CORTEXOS_API_URL": "http://localhost:8093"
+      }
+    }
+  }
+}

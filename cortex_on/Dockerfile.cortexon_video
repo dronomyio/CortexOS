@@ -1,0 +1,54 @@
+# Dockerfile for CortexON with Video Understanding Integration
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    ca-certificates \
+    curl \
+    git \
+    build-essential \
+    g++ \
+  && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy and install CortexON requirements first (for better caching)
+COPY requirements.txt /tmp/cortexon_requirements.txt
+RUN pip install --no-cache-dir -U pip \
+ && pip install --no-cache-dir -r /tmp/cortexon_requirements.txt
+
+# Install video understanding specific dependencies
+RUN pip install --no-cache-dir \
+    pymongo>=4.6.0 \
+    yt-dlp \
+    openai-whisper \
+    torch \
+    torchvision \
+    weaviate-client>=4.9.0 \
+    tiktoken \
+    pillow \
+    ImageHash \
+    scikit-learn \
+    transformers \
+    opencv-python \
+    sentence-transformers>=2.2.2
+
+# Create ALL directories for video processing (including uploads!)
+RUN mkdir -p /data/uploads /data/downloads /data/out /data/cache /data/clips
+
+# Pre-download Whisper tiny model so first ingest doesn't timeout
+RUN python3 -c "import whisper; whisper.load_model('tiny')" 2>/dev/null || true
+
+# Copy the CortexON application code
+COPY . /app/
+
+# Set PYTHONPATH so imports work
+ENV PYTHONPATH=/app
+
+# Expose the FastAPI port
+EXPOSE 8081
+
+# Start the CortexON application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8081", "--reload"]

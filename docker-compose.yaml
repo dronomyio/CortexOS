@@ -1,0 +1,109 @@
+services:
+  cortex_on:
+    build:
+      context: ./cortex_on
+      dockerfile: Dockerfile.cortexon_video
+    environment:
+      - MONGODB_URI=mongodb://admin:${MONGODB_PASSWORD:-changeme}@mongodb:27017/
+      - WEAVIATE_URL=http://weaviate:8080
+      - OPIK_ENABLED=${OPIK_ENABLED:-false}
+      - OPIK_URL_OVERRIDE=${OPIK_URL_OVERRIDE:-http://host.docker.internal:5173/api}
+      - OPIK_WORKSPACE=default
+      - OPIK_PROJECT_NAME=CortexVid
+      - WHISPER_MODEL=tiny
+      - TEXT_PAID_FALLBACK=true
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL_NAME=${ANTHROPIC_MODEL_NAME}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - mongodb
+      - weaviate
+    volumes:
+      - ./cortex_on:/app
+    env_file:
+      - .env
+    restart: always
+    networks:
+      - cortex_network
+    ports:
+      - "8093:8081"           # CortexON API
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - cortex_on
+    restart: always
+    networks:
+      - cortex_network
+    ports:
+      - "3000:3000"           # CortexOS Dashboard
+
+  # Uncomment to re-enable the agentic browser service
+  # agentic_browser:
+  #   build:
+  #     context: ./ta-browser
+  #     dockerfile: Dockerfile
+  #   volumes:
+  #     - ./ta-browser:/app
+  #   env_file:
+  #     - .env
+  #   restart: always
+  #   networks:
+  #     - cortex_network
+  #   ports:
+  #     - "8087:8082"
+
+  mongodb:
+    image: mongo:7.0
+    container_name: video_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_PASSWORD:-changeme}
+      MONGO_INITDB_DATABASE: video_understanding
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./cortex_on/scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - cortex_network
+
+  weaviate:
+    image: semitechnologies/weaviate:1.34.8
+    container_name: codex-weaviate
+    restart: unless-stopped
+    ports:
+      - "8084:8080"
+      - "50054:50051"
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      QUERY_DEFAULTS_LIMIT: "25"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+      AUTOSCHEMA_ENABLED: "true"
+      CLUSTER_HOSTNAME: "weaviate"
+      CLUSTER_GOSSIP_BIND_PORT: "7946"
+      CLUSTER_DATA_BIND_PORT: "7947"
+      CLUSTER_JOIN: ""
+      LOG_LEVEL: "info"
+      LIMIT_RESOURCES: "true"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    networks:
+      - cortex_network
+
+networks:
+  cortex_network:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+  weaviate_data:

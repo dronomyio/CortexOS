@@ -1,0 +1,746 @@
+"""
+CortexOS — Video Ingest Agent
+==============================
+
+Subagent responsible for the full video ingest pipeline:
+  Download (yt-dlp) → Transcribe (Whisper) → Keyframes (CLIP) → Index (Weaviate)
+
+Works with opus-planner for selective processing:
+  - Opus decides which segments need CLIP analysis (skip filler/intros)
+  - Opus sets vision_priority (high → 6 frames, normal → 4, low → 2)
+  - Opus flags clip-worthy segments and claims to verify
+
+Supports four ingest modes:
+  1. File upload   — raw video file on disk
+  2. URL download  — single YouTube URL with optional time-range
+  3. Batch URLs    — multiple YouTube URLs with time-ranges
+  4. Folder        — all video files in a local directory
+
+All operations traced via Opik observability.
+
+Location: /app/agents/video_ingest_agent.py
+Import:   from agents.video_ingest_agent import VideoIngestAgent
+"""
+
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+@dataclass
+class IngestConfig:
+    """Video ingest pipeline configuration."""
+    whisper_model: str = field(
+        default_factory=lambda: os.getenv("WHISPER_MODEL", "tiny")
+    )
+    data_dir: Path = field(
+        default_factory=lambda: Path(os.getenv("DATA_DIR", "/data"))
+    )
+    weaviate_url: str = field(
+        default_factory=lambda: os.getenv("WEAVIATE_URL", "http://weaviate:8080")
+    )
+    scripts_dir: str = "/app/video_scripts"
+    clip_fps: int = 1
+    clip_default_k: int = 4
+    clip_max_hamming: int = 6
+    max_concurrent_downloads: int = 3
+    max_concurrent_clip: int = 2
+    ytdlp_format: str = "bestvideo[height<=720]+bestaudio/best[height<=720]"
+    ytdlp_timeout: int = 120
+
+
+# ── Data Models ──────────────────────────────────────────────────────────────
+
+@dataclass
+class IngestResult:
+    """Result of a single video ingest."""
+    video_id: str
+    source: str
+    source_path: str
+    segments_count: int
+    transcription_seconds: float
+    index_json: Optional[str] = None
+    opus_plan: Optional[Dict] = None
+    vision_segments: int = 0
+    skipped_segments: int = 0
+    keyframes_indexed: int = 0
+    transcripts_indexed: bool = False
+    adaptive_analysis: List[Dict] = field(default_factory=list)
+    pipeline_duration_seconds: float = 0.0
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "video_id": self.video_id,
+            "source": self.source,
+            "source_path": self.source_path,
+            "segments_count": self.segments_count,
+            "transcription_seconds": round(self.transcription_seconds, 2),
+            "index_json": self.index_json,
+            "opus_plan": self.opus_plan,
+            "vision_segments": self.vision_segments,
+            "skipped_segments": self.skipped_segments,
+            "keyframes_indexed": self.keyframes_indexed,
+            "transcripts_indexed": self.transcripts_indexed,
+            "adaptive_analysis": self.adaptive_analysis,
+            "pipeline_duration_seconds": round(self.pipeline_duration_seconds, 2),
+            "error": self.error,
+        }
+
+
+@dataclass
+class DownloadResult:
+    video_id: str
+    video_path: Path
+    title: str
+    duration_seconds: float
+    success: bool
+    error: Optional[str] = None
+
+
+@dataclass
+class BatchIngestResult:
+    total_urls: int
+    successful: int
+    failed: int
+    results: List[IngestResult]
+    total_duration_seconds: float
+
+
+# ── Observability ────────────────────────────────────────────────────────────
+
+from contextlib import contextmanager
+
+@contextmanager
+def _trace_ctx(name, metadata=None):
+    """Simple context manager for tracing ingest operations."""
+    _meta = dict(metadata or {})
+    class _Span:
+        def set_metadata(self, d):
+            _meta.update(d)
+    span = _Span()
+    try:
+        yield span
+    finally:
+        try:
+            from agents.observability import _record_metric
+            _record_metric(f"{name}.completed", 1)
+        except ImportError:
+            pass
+
+
+# ── Subprocess helper ────────────────────────────────────────────────────────
+
+async def _run(cmd: List[str], cwd: Optional[str] = None,
+               timeout: int = 600) -> subprocess.CompletedProcess:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(cmd[:3])}...")
+
+    return subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode,
+        stdout=out.decode("utf-8", errors="replace"),
+        stderr=err.decode("utf-8", errors="replace"),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VideoIngestAgent
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VideoIngestAgent:
+    """
+    CortexOS Video Ingest Subagent.
+
+    Usage:
+        agent = VideoIngestAgent()
+        await agent.startup()
+
+        result = await agent.ingest_file("/data/uploads/video.mp4")
+        result = await agent.ingest_url("https://youtube.com/watch?v=xxx", start_time="1:30")
+        result = await agent.ingest_batch([{"url": "...", "title": "..."}])
+        result = await agent.ingest_folder("/data/clips/tom_lee")
+    """
+
+    def __init__(self, config: Optional[IngestConfig] = None,
+                 opus_planner=None):
+        self.config = config or IngestConfig()
+        self.opus_planner = opus_planner
+        self._started = False
+
+        self.uploads_dir = self.config.data_dir / "uploads"
+        self.out_dir = self.config.data_dir / "out"
+        self.clips_dir = self.out_dir / "clips"
+        self.downloads_dir = self.config.data_dir / "downloads"
+
+        self._stats = {
+            "videos_ingested": 0,
+            "urls_downloaded": 0,
+            "segments_processed": 0,
+            "segments_skipped_by_opus": 0,
+            "keyframes_indexed": 0,
+            "total_duration_seconds": 0.0,
+            "errors": 0,
+        }
+
+    async def startup(self):
+        """Create directories and verify dependencies."""
+        for d in (self.uploads_dir, self.out_dir, self.clips_dir, self.downloads_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        import shutil
+        if not shutil.which("ffmpeg"):
+            logger.warning("ffmpeg not found — video segmentation will fail")
+        if not shutil.which("yt-dlp"):
+            logger.warning("yt-dlp not found — URL downloads will fail")
+
+        scripts = ["yt_slice_chatgpt.py", "keyframes_describe.py",
+                    "weaviate_ingest.py", "weaviate_ingest_keyframes.py"]
+        for s in scripts:
+            if not Path(self.config.scripts_dir, s).exists():
+                logger.warning(f"Script not found: {self.config.scripts_dir}/{s}")
+
+        self._started = True
+        logger.info(f"[VideoIngestAgent] Started — whisper={self.config.whisper_model}, "
+                     f"opus_planner={'active' if self.opus_planner else 'none'}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "agent": "video-ingest",
+            "status": "active" if self._started else "not started",
+            "opus_planner": "connected" if self.opus_planner else "none",
+            "config": {
+                "whisper_model": self.config.whisper_model,
+                "weaviate_url": self.config.weaviate_url,
+                "clip_fps": self.config.clip_fps,
+                "clip_default_k": self.config.clip_default_k,
+            },
+            **self._stats,
+        }
+
+    # ── Mode 1: File ─────────────────────────────────────────────────────
+
+    async def ingest_file(self, video_path: str,
+                          video_id: Optional[str] = None,
+                          progress_callback=None) -> IngestResult:
+        # traced via _trace_ctx
+        video_id = video_id or uuid.uuid4().hex[:12]
+        t0 = time.perf_counter()
+
+        with _trace_ctx("video_ingest.file", {
+            "video_id": video_id, "source": "upload", "video_path": video_path,
+        }) as span:
+            try:
+                result = await self._run_pipeline(
+                    video_path=Path(video_path), video_id=video_id,
+                    source="upload", progress_callback=progress_callback,
+                )
+                result.pipeline_duration_seconds = time.perf_counter() - t0
+                self._update_stats(result)
+                span.set_metadata({
+                    "segments": result.segments_count,
+                    "vision_segments": result.vision_segments,
+                    "duration_s": result.pipeline_duration_seconds,
+                })
+                return result
+            except Exception as e:
+                self._stats["errors"] += 1
+                logger.error(f"[VideoIngestAgent] File ingest failed: {e}")
+                return IngestResult(
+                    video_id=video_id, source="upload",
+                    source_path=video_path, segments_count=0,
+                    transcription_seconds=0, error=str(e),
+                    pipeline_duration_seconds=time.perf_counter() - t0,
+                )
+
+    # ── Mode 2: URL ──────────────────────────────────────────────────────
+
+    async def ingest_url(self, url: str, title: Optional[str] = None,
+                         start_time: Optional[str] = None,
+                         end_time: Optional[str] = None,
+                         video_id: Optional[str] = None,
+                         progress_callback=None) -> IngestResult:
+        # traced via _trace_ctx
+        video_id = video_id or uuid.uuid4().hex[:12]
+        t0 = time.perf_counter()
+
+        with _trace_ctx("video_ingest.url", {
+            "video_id": video_id, "source": "url", "url": url,
+            "title": title, "start_time": start_time, "end_time": end_time,
+        }) as span:
+            try:
+                if progress_callback:
+                    await progress_callback(0.05, f"Downloading: {title or url[:60]}")
+
+                dl = await self._download_url(url, video_id, start_time, end_time)
+                if not dl.success:
+                    raise RuntimeError(f"Download failed: {dl.error}")
+
+                self._stats["urls_downloaded"] += 1
+
+                result = await self._run_pipeline(
+                    video_path=dl.video_path, video_id=video_id,
+                    source="url", progress_callback=progress_callback,
+                )
+                result.pipeline_duration_seconds = time.perf_counter() - t0
+                result.source_path = url
+                self._update_stats(result)
+
+                span.set_metadata({
+                    "title": title or dl.title,
+                    "segments": result.segments_count,
+                    "duration_s": result.pipeline_duration_seconds,
+                })
+                return result
+
+            except Exception as e:
+                self._stats["errors"] += 1
+                logger.error(f"[VideoIngestAgent] URL ingest failed: {e}")
+                return IngestResult(
+                    video_id=video_id, source="url",
+                    source_path=url, segments_count=0,
+                    transcription_seconds=0, error=str(e),
+                    pipeline_duration_seconds=time.perf_counter() - t0,
+                )
+
+    # ── Mode 3: Batch ────────────────────────────────────────────────────
+
+    async def ingest_batch(self, urls: List[Dict[str, str]],
+                           progress_callback=None) -> BatchIngestResult:
+        # traced via _trace_ctx
+        t0 = time.perf_counter()
+
+        with _trace_ctx("video_ingest.batch", {"total_urls": len(urls)}) as span:
+            sem = asyncio.Semaphore(self.config.max_concurrent_downloads)
+
+            async def process_one(item: Dict, idx: int) -> IngestResult:
+                async with sem:
+                    if progress_callback:
+                        await progress_callback(
+                            idx / len(urls),
+                            f"Processing {idx+1}/{len(urls)}: {item.get('title', item['url'][:50])}"
+                        )
+                    return await self.ingest_url(
+                        url=item["url"], title=item.get("title"),
+                        start_time=item.get("start_time"),
+                        end_time=item.get("end_time"),
+                    )
+
+            results = await asyncio.gather(
+                *[process_one(item, i) for i, item in enumerate(urls)],
+                return_exceptions=True,
+            )
+
+            final = []
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    final.append(IngestResult(
+                        video_id=f"batch_{i}", source="batch",
+                        source_path=urls[i]["url"], segments_count=0,
+                        transcription_seconds=0, error=str(r),
+                    ))
+                else:
+                    final.append(r)
+
+            successful = len([r for r in final if not r.error])
+            failed = len([r for r in final if r.error])
+
+            span.set_metadata({"successful": successful, "failed": failed})
+
+            return BatchIngestResult(
+                total_urls=len(urls), successful=successful, failed=failed,
+                results=final, total_duration_seconds=time.perf_counter() - t0,
+            )
+
+    # ── Mode 4: Folder ───────────────────────────────────────────────────
+
+    async def ingest_folder(self, folder_path: str,
+                            progress_callback=None) -> BatchIngestResult:
+        folder = Path(folder_path)
+        if not folder.exists():
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+        video_exts = {".mp4", ".webm", ".mkv", ".avi", ".mov"}
+        video_files = sorted([
+            f for f in folder.iterdir() if f.suffix.lower() in video_exts
+        ])
+        if not video_files:
+            raise ValueError(f"No video files found in {folder_path}")
+
+        t0 = time.perf_counter()
+        results = []
+        for i, vf in enumerate(video_files):
+            if progress_callback:
+                await progress_callback(i / len(video_files),
+                                        f"Processing {i+1}/{len(video_files)}: {vf.name}")
+            result = await self.ingest_file(str(vf))
+            results.append(result)
+
+        successful = len([r for r in results if not r.error])
+        return BatchIngestResult(
+            total_urls=len(video_files), successful=successful,
+            failed=len(video_files) - successful,
+            results=results, total_duration_seconds=time.perf_counter() - t0,
+        )
+
+    # ── Download ─────────────────────────────────────────────────────────
+
+    async def _download_url(self, url: str, video_id: str,
+                            start_time: Optional[str] = None,
+                            end_time: Optional[str] = None) -> DownloadResult:
+        t0 = time.perf_counter()
+        dest = self.downloads_dir / f"{video_id}.mp4"
+
+        cmd = [
+            "yt-dlp",
+            "-f", self.config.ytdlp_format,
+            "--merge-output-format", "mp4",
+            "-o", str(dest),
+            "--no-playlist",
+            "--socket-timeout", "30",
+        ]
+
+        if start_time and end_time:
+            cmd += ["--download-sections", f"*{start_time}-{end_time}",
+                    "--force-keyframes-at-cuts"]
+        elif start_time:
+            cmd += ["--download-sections", f"*{start_time}-",
+                    "--force-keyframes-at-cuts"]
+
+        cmd.append(url)
+
+        try:
+            r = await _run(cmd, timeout=self.config.ytdlp_timeout)
+            if r.returncode != 0:
+                return DownloadResult(
+                    video_id=video_id, video_path=dest, title="",
+                    duration_seconds=time.perf_counter() - t0,
+                    success=False, error=r.stderr[:500],
+                )
+
+            if not dest.exists():
+                candidates = list(self.downloads_dir.glob(f"{video_id}.*"))
+                if candidates:
+                    dest = candidates[0]
+                else:
+                    return DownloadResult(
+                        video_id=video_id, video_path=dest, title="",
+                        duration_seconds=time.perf_counter() - t0,
+                        success=False, error="Download produced no file",
+                    )
+
+            return DownloadResult(
+                video_id=video_id, video_path=dest,
+                title=dest.stem, duration_seconds=time.perf_counter() - t0,
+                success=True,
+            )
+        except Exception as e:
+            return DownloadResult(
+                video_id=video_id, video_path=dest, title="",
+                duration_seconds=time.perf_counter() - t0,
+                success=False, error=str(e),
+            )
+
+    # ── Main Pipeline ────────────────────────────────────────────────────
+
+    async def _run_pipeline(self, video_path: Path, video_id: str,
+                            source: str, progress_callback=None) -> IngestResult:
+        """
+        Core 5-step pipeline:
+          1. Slice + Transcribe (ffmpeg + Whisper)
+          2. Opus Planning (selective processing)
+          3. Weaviate Transcript Ingest
+          4. Opus-Selective CLIP Keyframe Extraction
+          5. Weaviate Keyframe Ingest + Adaptive Analysis
+        """
+        # Ensure all data directories exist
+        for d in (self.uploads_dir, self.out_dir, self.clips_dir, self.downloads_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Verify input file exists before starting pipeline
+        vp = Path(video_path)
+        if not vp.exists():
+            raise RuntimeError(f"Video file not found: {video_path} — check DATA_DIR and uploads directory")
+
+        vid_out = self.out_dir / video_id
+        vid_out.mkdir(parents=True, exist_ok=True)
+
+        # ── Step 1: Slice + Transcribe ───────────────────────────────────
+        if progress_callback:
+            await progress_callback(0.10, f"Step 1/5: Whisper ({self.config.whisper_model}) transcription…")
+
+        t_whisper = time.perf_counter()
+        logger.info(f"[VideoIngestAgent] Running Whisper on {video_path} ({vp.stat().st_size / 1e6:.1f}MB)")
+        r = await _run([
+            "python3", f"{self.config.scripts_dir}/yt_slice_chatgpt.py",
+            "--input", str(video_path),
+            "--outdir", str(vid_out),
+            "--whisper-model", self.config.whisper_model,
+        ], timeout=600)
+
+        transcription_time = time.perf_counter() - t_whisper
+        if r.returncode != 0:
+            raise RuntimeError(f"Slice/transcribe failed: {r.stderr[:500]}")
+
+        json_path = vid_out / "snippets_with_transcripts.json"
+        if not json_path.exists():
+            candidates = list(vid_out.rglob("snippets_with_transcripts.json"))
+            if not candidates:
+                raise RuntimeError("Slicer produced no snippets JSON")
+            json_path = candidates[0]
+
+        snippets_data = json.loads(json_path.read_text(encoding="utf-8"))
+        segments = snippets_data.get("segments", [])
+
+        logger.info(f"[VideoIngestAgent] Transcribed {len(segments)} segments "
+                     f"in {transcription_time:.1f}s")
+
+        # ── Step 2: Opus Planning ────────────────────────────────────────
+        if progress_callback:
+            await progress_callback(0.35, "Step 2/5: Opus 4.6 planning…")
+
+        opus_plan = None
+        ingest_plans = None
+
+        if self.opus_planner and len(segments) > 0:
+            try:
+                plan_segments = [
+                    {
+                        "index": seg.get("index", i),
+                        "transcript": seg.get("transcript", ""),
+                        "start_seconds": seg.get("start_seconds", 0),
+                        "end_seconds": seg.get("end_seconds", 0),
+                        "keyframe_count": len(seg.get("frames", {}).get("frame_files", [])),
+                    }
+                    for i, seg in enumerate(segments)
+                ]
+
+                ingest_plans = await self.opus_planner.plan_ingest(plan_segments)
+                opus_plan = {
+                    "total_segments": len(segments),
+                    "vision_planned": sum(1 for p in ingest_plans if p.vision_analysis),
+                    "enrichment_planned": sum(1 for p in ingest_plans if p.enrichment),
+                    "clip_worthy": sum(1 for p in ingest_plans if p.clip_worthy),
+                    "skipped": [
+                        {"segment": p.segment_index, "reason": p.skip_reason}
+                        for p in ingest_plans if p.skip_reason
+                    ],
+                    "plans": [p.to_dict() for p in ingest_plans],
+                }
+                logger.info(f"[Opus] Plan: {opus_plan['vision_planned']}/{len(segments)} vision, "
+                            f"{opus_plan['enrichment_planned']}/{len(segments)} enrichment")
+            except Exception as e:
+                logger.warning(f"[Opus] Planning failed: {e} — processing all segments")
+                ingest_plans = None
+
+        # ── Step 3: Weaviate Transcript Ingest ───────────────────────────
+        if progress_callback:
+            await progress_callback(0.50, "Step 3/5: Indexing transcripts in Weaviate…")
+
+        r = await _run([
+            "python3", f"{self.config.scripts_dir}/weaviate_ingest.py",
+            "--json", str(json_path),
+            "--video-id", video_id,
+            "--collection", "VideoChunks",
+        ])
+        transcripts_indexed = r.returncode == 0
+        if not transcripts_indexed:
+            logger.warning(f"[VideoIngestAgent] Weaviate transcript ingest failed: {r.stderr[:300]}")
+
+        # ── Step 4: Opus-Selective CLIP Keyframe Extraction ──────────────
+        if progress_callback:
+            plan_msg = (f"Opus: {opus_plan['vision_planned']}/{len(segments)} need vision"
+                        if opus_plan else "Processing all segments")
+            await progress_callback(0.65, f"Step 4/5: CLIP keyframes ({plan_msg})…")
+
+        all_keyframe_jsons: List[Path] = []
+        clip_sem = asyncio.Semaphore(self.config.max_concurrent_clip)
+
+        async def extract_keyframes(i: int, seg: Dict) -> Optional[Path]:
+            async with clip_sem:
+                if ingest_plans and i < len(ingest_plans):
+                    plan = ingest_plans[i]
+                    if not plan.vision_analysis:
+                        return None
+
+                seg_idx = seg.get("index", i)
+                seg_video = seg.get("video_path", "")
+                seg_start = seg.get("start_seconds", 0.0)
+                seg_end = seg.get("end_seconds", 0.0)
+                frames_info = seg.get("frames", {})
+                frames_dir = frames_info.get("frames_dir", "")
+
+                if not seg_video or not Path(seg_video).exists():
+                    return None
+
+                kf_json = vid_out / f"keyframes_seg_{seg_idx:03d}.json"
+
+                k_frames = str(self.config.clip_default_k)
+                if ingest_plans and i < len(ingest_plans):
+                    priority = ingest_plans[i].vision_priority
+                    if priority == "high":
+                        k_frames = "6"
+                    elif priority == "low":
+                        k_frames = "2"
+
+                kf_cmd = [
+                    "python3", f"{self.config.scripts_dir}/keyframes_describe.py",
+                    "--out", str(kf_json),
+                    "--fps", str(self.config.clip_fps),
+                    "--k", k_frames,
+                    "--max-hamming", str(self.config.clip_max_hamming),
+                    "--clip-id", f"{video_id}_seg{seg_idx}",
+                    "--t1", str(seg_start),
+                    "--t2", str(seg_end),
+                    "--no-llm", "1",
+                ]
+
+                if frames_dir and Path(frames_dir).exists():
+                    kf_cmd += ["--frames-dir", frames_dir]
+                else:
+                    kf_cmd += ["--clip", seg_video]
+
+                r = await _run(kf_cmd, timeout=120)
+                if r.returncode == 0 and kf_json.exists():
+                    return kf_json
+                return None
+
+        kf_results = await asyncio.gather(
+            *[extract_keyframes(i, seg) for i, seg in enumerate(segments)],
+            return_exceptions=True,
+        )
+        all_keyframe_jsons = [r for r in kf_results if isinstance(r, Path)]
+
+        # ── Step 4b: Opus Adaptive Analysis ──────────────────────────────
+        adaptive_results = []
+        if self.opus_planner and ingest_plans:
+            for i, seg in enumerate(segments):
+                if i < len(ingest_plans) and ingest_plans[i].vision_analysis:
+                    kf_json = vid_out / f"keyframes_seg_{seg.get('index', i):03d}.json"
+                    if kf_json.exists():
+                        try:
+                            kf_data = json.loads(kf_json.read_text())
+                            analysis = await self.opus_planner.analyze_segment_deep(
+                                transcript=seg.get("transcript", ""),
+                                vision_output={"keyframes": kf_data.get("keyframes", [])},
+                                video_id=video_id,
+                                start_seconds=seg.get("start_seconds", 0),
+                                end_seconds=seg.get("end_seconds", 0),
+                            )
+                            if analysis.discrepancies or analysis.risk_score > 0.5:
+                                adaptive_results.append({
+                                    "segment": i,
+                                    "risk_score": analysis.risk_score,
+                                    "discrepancies": analysis.discrepancies,
+                                    "claims_to_verify": analysis.claims_to_verify,
+                                })
+                        except Exception as e:
+                            logger.warning(f"[Opus] Adaptive analysis failed for segment {i}: {e}")
+
+        # ── Step 5: Ingest Keyframes into Weaviate ───────────────────────
+        if progress_callback:
+            await progress_callback(0.85, f"Step 5/5: Indexing {len(all_keyframe_jsons)} keyframe sets…")
+
+        kf_ingested = 0
+        for kf_json in all_keyframe_jsons:
+            clip_id = kf_json.stem
+            r = await _run([
+                "python3", f"{self.config.scripts_dir}/weaviate_ingest_keyframes.py",
+                "--json", str(kf_json),
+                "--video-id", video_id,
+                "--clip-id", clip_id,
+                "--collection", "VideoKeyframe",
+            ])
+            if r.returncode == 0:
+                kf_ingested += 1
+
+        # ── Build result ─────────────────────────────────────────────────
+        vision_segments = opus_plan["vision_planned"] if opus_plan else len(segments)
+        skipped = (len(segments) - vision_segments) if opus_plan else 0
+
+        if progress_callback:
+            opus_msg = ""
+            if opus_plan:
+                opus_msg = f" | Opus: skipped {skipped}"
+                if adaptive_results:
+                    opus_msg += f", {len(adaptive_results)} risk segments"
+            await progress_callback(1.0, f"Done ✓ — {kf_ingested} visual + transcript indexed{opus_msg}")
+
+        return IngestResult(
+            video_id=video_id, source=source,
+            source_path=str(video_path),
+            segments_count=len(segments),
+            transcription_seconds=transcription_time,
+            index_json=str(json_path),
+            opus_plan=opus_plan,
+            vision_segments=vision_segments,
+            skipped_segments=skipped,
+            keyframes_indexed=kf_ingested,
+            transcripts_indexed=transcripts_indexed,
+            adaptive_analysis=adaptive_results,
+        )
+
+    def _update_stats(self, result: IngestResult):
+        self._stats["videos_ingested"] += 1
+        self._stats["segments_processed"] += result.segments_count
+        self._stats["segments_skipped_by_opus"] += result.skipped_segments
+        self._stats["keyframes_indexed"] += result.keyframes_indexed
+        self._stats["total_duration_seconds"] += result.pipeline_duration_seconds
+        if result.error:
+            self._stats["errors"] += 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Auto-Discovery: register_routes(app)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ingest_instance: Optional[VideoIngestAgent] = None
+
+def _get_ingest_agent() -> VideoIngestAgent:
+    """Lazy singleton for the video ingest agent."""
+    global _ingest_instance
+    if _ingest_instance is None:
+        _ingest_instance = VideoIngestAgent()
+    return _ingest_instance
+
+
+def register_routes(app):
+    """Auto-discovered by main.py — registers ingest stats endpoint."""
+
+    @app.get("/api/v1/ingest/stats", tags=["video-ingest"])
+    async def ingest_stats():
+        """VideoIngestAgent statistics — videos ingested, segments processed, Opus skip rate."""
+        agent = _get_ingest_agent()
+        return {
+            "agent": "video-ingest",
+            "status": "active",
+            "opus_planner": "connected" if agent.opus else "disconnected",
+            "config": {
+                "whisper_model": agent.config.whisper_model,
+                "weaviate_url": agent.config.weaviate_url,
+                "clip_fps": agent.config.clip_fps,
+                "clip_default_k": agent.config.clip_default_k,
+            },
+            **agent.get_stats(),
+        }
+
+    logger.info("[VideoIngestAgent] Registered routes: /api/v1/ingest/stats")

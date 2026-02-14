@@ -1,0 +1,30 @@
+agents/
+├── __init__.py                    # Safe init
+├── base_agent.py                  # Base class
+├── code_agent.py                  # Legacy (instructor.py → /ws)
+├── context_enrichment_agent.py    # Active (orchestrator → Parallel.ai)
+├── observability.py               # Active (Opik tracing)
+├── opus_planner.py                # Active (Opus brain)
+├── orchestrator.py                # Active (SYNTHESIS_STRATEGIES + x402 wiring)
+├── parallel_client.py             # Active (Parallel.ai API client)
+├── planner_agent.py               # Legacy (instructor.py → /ws)
+├── synthesis_agent.py             # Active (orchestrator → synthesis)
+├── video_ingest_agent.py          # NEW (CortexOS pipeline agent)
+├── video_qa_agent.py              # Active (orchestrator → QA)
+├── web_surfer.py                  # Legacy (instructor.py → /ws)
+└── x402_payment_agent.py          # Active (x402 payments for all agents)
+
+
+deleted
+
+rm -rf video/
+rm orchestrator_video_tools.py
+rm orchestrator_video_tools_updated.py
+rm orchestrator_video_tools_mongodb.py
+rm orchestrator_agent.py
+rm -rf __pycache__
+
+Keep everything else — the legacy agents (code_agent, web_surfer, planner_agent) are still referenced through instructor.py → the /ws websocket endpoint. They'll fail gracefully if dependencies are missing (try/except), but deleting them would cause import errors.
+
+
+
