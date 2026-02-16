@@ -566,13 +566,41 @@ class VideoIngestAgent:
         if not transcripts_indexed:
             logger.warning(f"[VideoIngestAgent] Weaviate transcript ingest failed: {r.stderr[:300]}")
 
-        # -- Step 4: CLIP Keyframe Extraction (SKIPPED - scripts not deployed) --
+        # ── Step 4: Opus-Selective CLIP Keyframe Extraction ──────────────
         if progress_callback:
-            await progress_callback(0.65, "Step 4/5: Skipping CLIP keyframes (not deployed)")
+            plan_msg = (f"Opus: {opus_plan['vision_planned']}/{len(segments)} need vision"
+                        if opus_plan else "Processing all segments")
+            await progress_callback(0.65, f"Step 4/5: CLIP keyframes ({plan_msg})…")
 
         all_keyframe_jsons: List[Path] = []
+        # SKIP CLIP — keyframes_describe.py not deployed yet
+        logger.info("[VideoIngestAgent] Skipping CLIP keyframes (scripts not available)")
+
+        # -- Step 4b: Opus Adaptive Analysis --
         adaptive_results = []
-        logger.info("[VideoIngestAgent] Skipping CLIP keyframes + adaptive analysis (scripts not available)")
+        if self.opus_planner and ingest_plans:
+            for i, seg in enumerate(segments):
+                if i < len(ingest_plans) and ingest_plans[i].vision_analysis:
+                    kf_json = vid_out / f"keyframes_seg_{seg.get('index', i):03d}.json"
+                    if kf_json.exists():
+                        try:
+                            kf_data = json.loads(kf_json.read_text())
+                            analysis = await self.opus_planner.analyze_segment_deep(
+                                transcript=seg.get("transcript", ""),
+                                vision_output={"keyframes": kf_data.get("keyframes", [])},
+                                video_id=video_id,
+                                start_seconds=seg.get("start_seconds", 0),
+                                end_seconds=seg.get("end_seconds", 0),
+                            )
+                            if analysis.discrepancies or analysis.risk_score > 0.5:
+                                adaptive_results.append({
+                                    "segment": i,
+                                    "risk_score": analysis.risk_score,
+                                    "discrepancies": analysis.discrepancies,
+                                    "claims_to_verify": analysis.claims_to_verify,
+                                })
+                        except Exception as e:
+                            logger.warning(f"[Opus] Adaptive analysis failed for segment {i}: {e}")
 
         # ── Step 5: Ingest Keyframes into Weaviate ───────────────────────
         if progress_callback:
@@ -604,18 +632,18 @@ class VideoIngestAgent:
             await progress_callback(1.0, f"Done ✓ — {kf_ingested} visual + transcript indexed{opus_msg}")
 
         return IngestResult(
-            video_id=video_id, source=source,
-            source_path=str(video_path),
-            segments_count=len(segments),
-            transcription_seconds=transcription_time,
-            index_json=str(json_path),
-            opus_plan=opus_plan,
-            vision_segments=vision_segments,
-            skipped_segments=skipped,
-            keyframes_indexed=kf_ingested,
-            transcripts_indexed=transcripts_indexed,
-            adaptive_analysis=adaptive_results,
-        )
+                video_id=video_id, source=source,
+                source_path=str(video_path),
+                segments_count=len(segments),
+                transcription_seconds=transcription_time,
+                index_json=str(json_path),
+                opus_plan=opus_plan,
+                vision_segments=vision_segments,
+                skipped_segments=skipped,
+                keyframes_indexed=kf_ingested,
+                transcripts_indexed=transcripts_indexed,
+                adaptive_analysis=adaptive_results,
+            )
 
     def _update_stats(self, result: IngestResult):
         self._stats["videos_ingested"] += 1

@@ -3,6 +3,7 @@ services:
     build:
       context: ./cortex_on
       dockerfile: Dockerfile.cortexon_video
+    command: ["bash", "/app/entrypoint.sh"]
     environment:
       - MONGODB_URI=mongodb://admin:${MONGODB_PASSWORD:-changeme}@mongodb:27017/
       - WEAVIATE_URL=http://weaviate:8080
@@ -14,6 +15,8 @@ services:
       - TEXT_PAID_FALLBACK=true
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - ANTHROPIC_MODEL_NAME=${ANTHROPIC_MODEL_NAME}
+      - SKIP_CLIP=true
+      - X402_ENABLED=false
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -21,13 +24,15 @@ services:
       - weaviate
     volumes:
       - ./cortex_on:/app
+      - huggingface_cache:/root/.cache/huggingface
+      - ./assets/mongodb_data/eth_usd_minute_combined.csv:/data/eth_usd_minute_combined.csv:ro
     env_file:
       - .env
     restart: always
     networks:
       - cortex_network
     ports:
-      - "8093:8081"           # CortexON API
+      - "8093:8081"
 
   frontend:
     build:
@@ -42,22 +47,7 @@ services:
     networks:
       - cortex_network
     ports:
-      - "3000:3000"           # CortexOS Dashboard
-
-  # Uncomment to re-enable the agentic browser service
-  # agentic_browser:
-  #   build:
-  #     context: ./ta-browser
-  #     dockerfile: Dockerfile
-  #   volumes:
-  #     - ./ta-browser:/app
-  #   env_file:
-  #     - .env
-  #   restart: always
-  #   networks:
-  #     - cortex_network
-  #   ports:
-  #     - "8087:8082"
+      - "3000:3000"
 
   mongodb:
     image: mongo:7.0
@@ -107,3 +97,4 @@ networks:
 volumes:
   mongodb_data:
   weaviate_data:
+  huggingface_cache:

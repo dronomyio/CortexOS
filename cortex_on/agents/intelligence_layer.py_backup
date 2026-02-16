@@ -236,197 +236,63 @@ class IntelligenceLayer:
         await self.initialize()
         start = time.time()
 
-        # ── Auto-load market data from MongoDB if not provided ──────────
-        if external_data is None:
-            try:
-                from agents.external_data_agent import ExternalDataAgent
-                market_agent = ExternalDataAgent()
-                await market_agent.initialize()
-                if market_agent.available:
-                    external_data = await market_agent.get_market_summary()
-                    logger.info(f"[IntelligenceLayer] Auto-loaded market data: "
-                                f"{external_data.get('total_days', 0)} days, "
-                                f"${external_data.get('period_low', 0):,.0f}-${external_data.get('period_high', 0):,.0f}")
-            except Exception as e:
-                logger.warning(f"[IntelligenceLayer] Could not load market data: {e}")
-
         videos = self._get_indexed_videos()[:max_videos]
         if not videos:
             return {"contradictions": [], "videos_analyzed": 0, "message": "No indexed videos found"}
 
-        video_summaries = []
+        # Extract claims from all videos
+        all_claims = []
         for v in videos:
             segments = self._load_segments(v["transcript_path"])
             if not segments:
                 continue
-            # Handle multiple transcript key names
-            full_text = ""
-            for seg in segments:
-                txt = (seg.get("transcript_text") or seg.get("transcript")
-                       or seg.get("text") or "")
-                if txt:
-                    ts = seg.get("start_seconds", seg.get("start", 0))
-                    full_text += f"[{int(ts)}s] {txt}\n"
-            if full_text.strip():
-                video_summaries.append({
+
+            if self._verifier and self._verifier._opus:
+                claims = await self._verifier.extract_claims(segments, v.get("opus_plan"))
+            else:
+                claims = self._verifier._extract_claims_heuristic(segments) if self._verifier else []
+
+            for c in claims:
+                c.video_id = v["video_id"]
+                if not c.speaker and v.get("title"):
+                    c.speaker = self._guess_speaker(v.get("title", ""))
+                all_claims.append({
+                    "claim_id": c.claim_id,
+                    "text": c.text,
+                    "speaker": c.speaker or "unknown",
+                    "category": c.category,
                     "video_id": v["video_id"],
-                    "title": v.get("title", v["video_id"][:12]),
+                    "timestamp_seconds": c.timestamp_seconds,
+                    "title": v.get("title", ""),
                     "date": v.get("upload_date", v.get("date", "")),
-                    "speaker": self._guess_speaker(v.get("title", "")),
-                    "transcript": full_text[:3000],  # Truncate for Opus context
                 })
 
-        if not video_summaries:
-            return {"contradictions": [], "videos_analyzed": len(videos), "total_claims": 0,
-                    "message": "No transcripts found in indexed videos"}
+        if not all_claims:
+            return {"contradictions": [], "videos_analyzed": len(videos), "total_claims": 0}
 
-        # ── Use Opus to extract claims AND find contradictions in one pass ──
-        result = await self._opus_extract_and_compare(video_summaries, external_data)
+        # Apply filters
+        if speaker_filter:
+            sf = speaker_filter.lower()
+            all_claims = [c for c in all_claims if sf in c["speaker"].lower()]
+        if topic_filter:
+            tf = topic_filter.lower()
+            all_claims = [c for c in all_claims if tf in c["text"].lower()]
+
+        # Use Opus to find contradictions
+        contradictions = await self._opus_find_contradictions(all_claims, external_data)
 
         elapsed = time.time() - start
         return {
             "videos_analyzed": len(videos),
-            "total_claims": result.get("total_claims", 0),
-            "contradictions": result.get("contradictions", []),
-            "contradiction_count": len(result.get("contradictions", [])),
-            "self_contradictions": len([c for c in result.get("contradictions", [])
-                                        if c.get("contradiction_type") == "self_contradiction"]),
-            "cross_speaker": len([c for c in result.get("contradictions", [])
-                                   if c.get("contradiction_type") == "cross_speaker"]),
-            "data_contradictions": len([c for c in result.get("contradictions", [])
-                                        if c.get("contradiction_type") == "data_contradiction"]),
+            "total_claims": len(all_claims),
+            "contradictions": [c.to_dict() for c in contradictions],
+            "contradiction_count": len(contradictions),
+            "self_contradictions": len([c for c in contradictions if c.contradiction_type == "self_contradiction"]),
+            "cross_speaker": len([c for c in contradictions if c.contradiction_type == "cross_speaker"]),
+            "data_contradictions": len([c for c in contradictions if c.contradiction_type == "data_contradiction"]),
             "elapsed_seconds": round(elapsed, 2),
             "external_data_provided": external_data is not None,
-            "claims": result.get("claims", []),
         }
-
-    async def _opus_extract_and_compare(
-        self, video_summaries: List[Dict], external_data: Optional[Dict] = None
-    ) -> Dict:
-        """Single Opus call: extract claims from all videos + find contradictions."""
-
-        videos_block = ""
-        for i, v in enumerate(video_summaries):
-            videos_block += f"\n--- VIDEO {i} ---\n"
-            videos_block += f"Title: {v['title']}\n"
-            videos_block += f"Speaker: {v['speaker']}\n"
-            videos_block += f"Date: {v['date']}\n"
-            videos_block += f"ID: {v['video_id'][:12]}\n"
-            videos_block += f"Transcript:\n{v['transcript']}\n"
-
-        data_block = ""
-        if external_data and not external_data.get("error"):
-            # Build compact summary — don't send all 44 daily bars
-            compact = {
-                "asset": external_data.get("asset", "ETH/USD"),
-                "data_range": external_data.get("data_range"),
-                "current_price": external_data.get("current_price"),
-                "period_open": external_data.get("period_open"),
-                "period_return_pct": external_data.get("period_return_pct"),
-                "period_high": external_data.get("period_high"),
-                "period_high_date": external_data.get("period_high_date"),
-                "period_low": external_data.get("period_low"),
-                "period_low_date": external_data.get("period_low_date"),
-                "max_drawdown_pct": external_data.get("max_drawdown_pct"),
-                "weekly_returns": external_data.get("weekly_returns", []),
-                "biggest_daily_moves": external_data.get("biggest_daily_moves", [])[:5],
-            }
-            # Add select daily prices (first, last, and any extreme days)
-            daily = external_data.get("daily_prices", [])
-            key_days = []
-            if daily:
-                key_days.append(daily[0])   # first day
-                key_days.append(daily[-1])  # last day
-                # Add the biggest move days
-                for move in compact.get("biggest_daily_moves", [])[:3]:
-                    for d in daily:
-                        if d["date"] == move["date"] and d not in key_days:
-                            key_days.append(d)
-                key_days.sort(key=lambda x: x["date"])
-            compact["key_daily_prices"] = key_days
-
-            data_block = f"""
-
-REAL ETH/USD MARKET DATA (from Polygon.io, stored in CortexOS MongoDB):
-```json
-{json.dumps(compact, indent=2)}
-```
-
-CRITICAL: Compare ALL analyst claims about ETH prices, returns, bottoms, tops, and 
-predictions against this REAL market data. If an analyst states a price or percentage
-that contradicts the actual data, flag it as "data_contradiction" with HIGH severity.
-
-Key facts to verify against:
-- ETH opened 2026 at ${compact.get('period_open', 'N/A')} and is now ${compact.get('current_price', 'N/A')}
-- Period return: {compact.get('period_return_pct', 'N/A')}%
-- Period high: ${compact.get('period_high', 'N/A')} on {compact.get('period_high_date', 'N/A')}
-- Period low: ${compact.get('period_low', 'N/A')} on {compact.get('period_low_date', 'N/A')}
-- Max drawdown: {compact.get('max_drawdown_pct', 'N/A')}%
-"""
-
-        system = """You are a financial media investigative analyst. You will receive transcripts 
-from multiple videos by crypto/finance analysts.
-
-Your job:
-1. Extract the KEY VERIFIABLE CLAIMS from each video (prices, predictions, statistics, timelines)
-2. Find ALL CONTRADICTIONS between videos or within the same speaker over time
-
-Return ONLY valid JSON with this structure:
-{
-  "claims": [
-    {
-      "text": "the actual claim text",
-      "speaker": "speaker name",
-      "video_id": "video ID",
-      "category": "prediction|statistic|price_target|opinion",
-      "timestamp_approx": "approximate timestamp"
-    }
-  ],
-  "contradictions": [
-    {
-      "claim_a": {"text": "first claim", "speaker": "name", "video_id": "id", "date": "date"},
-      "claim_b": {"text": "contradicting claim", "speaker": "name", "video_id": "id", "date": "date"},
-      "contradiction_type": "self_contradiction|cross_speaker|data_contradiction",
-      "severity": "high|medium|low",
-      "explanation": "Why these claims contradict each other"
-    }
-  ],
-  "total_claims": 15
-}
-
-Rules:
-- Extract at least 3-5 claims per video if they contain verifiable statements
-- Self-contradiction: same speaker says conflicting things across videos
-- Cross-speaker: different speakers make opposing claims
-- Data contradiction: claim is contradicted by provided market data
-- HIGH severity: direct factual/numerical conflict
-- MEDIUM: directional conflict (bullish vs bearish on same asset)
-- LOW: subtle inconsistency
-- Focus on crypto/finance claims: prices, targets, timelines, market predictions
-- If no contradictions found, return empty array but still list claims
-"""
-
-        user = f"VIDEOS:\n{videos_block}{data_block}"
-
-        raw = await self._call_opus(system, user, max_tokens=6000)
-
-        # Parse JSON response
-        try:
-            # Strip markdown fences if present
-            clean = raw.strip()
-            if clean.startswith("```"):
-                clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
-            if clean.endswith("```"):
-                clean = clean[:-3]
-            clean = clean.strip()
-            if clean.startswith("json"):
-                clean = clean[4:].strip()
-            result = json.loads(clean)
-            return result
-        except (json.JSONDecodeError, Exception) as e:
-            logger.error(f"[IntelligenceLayer] Failed to parse Opus response: {e}")
-            logger.error(f"[IntelligenceLayer] Raw response: {raw[:500]}")
-            return {"claims": [], "contradictions": [], "total_claims": 0}
 
     async def _opus_find_contradictions(
         self, claims: List[Dict], external_data: Optional[Dict] = None

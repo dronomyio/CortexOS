@@ -392,8 +392,8 @@ export default function CortexOS() {
     if (searchQ&&!v.title.toLowerCase().includes(searchQ.toLowerCase())&&!v.speaker.toLowerCase().includes(searchQ.toLowerCase())) return false;
     return true;
   });
-  const totalClaims=contradictions?.total_claims||videos.reduce((s,v)=>s+v.claims,0);
-  const totalContra=contradictions?.contradiction_count||videos.reduce((s,v)=>s+v.contradictions,0);
+  const totalClaims=videos.reduce((s,v)=>s+v.claims,0);
+  const totalContra=videos.reduce((s,v)=>s+v.contradictions,0);
 
   const W=960,H=660,ap=archPhase;
 
@@ -518,15 +518,15 @@ export default function CortexOS() {
 
                 {/* Active Jobs */}
                 <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:8,padding:10}}>
-                  <div style={{fontFamily:mono,fontSize:9,fontWeight:700,color:"#e0e4ec",letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:6}}>Active Jobs ({apiJobs.filter(j=>j.status!=="ready"&&j.status!=="failed").length})</div>
+                  <div style={{fontFamily:mono,fontSize:8,fontWeight:700,color:C.dim,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:6}}>Active Jobs ({apiJobs.filter(j=>j.status!=="ready"&&j.status!=="failed").length})</div>
                   {apiJobs.length===0?(
-                    <div style={{fontFamily:mono,fontSize:9,color:C.muted,padding:"4px 0"}}>No jobs — upload or paste a URL</div>
+                    <div style={{fontFamily:mono,fontSize:8,color:C.dim,padding:"4px 0"}}>No jobs — upload or paste a URL</div>
                   ):apiJobs.slice(0,8).map((j,i)=>(
-                    <div key={j.job_id||i} style={{display:"flex",alignItems:"center",gap:5,padding:"4px 0",borderBottom:i<Math.min(apiJobs.length,8)-1?`1px solid ${C.border}`:"none"}}>
-                      <Dot color={j.status==="ready"?C.green:j.status==="failed"?C.red:C.opus} s={4}/>
-                      <span style={{fontFamily:mono,fontSize:9,color:"#c8d0dc",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{j.video_id} — {(j.message||"").slice(0,35)}</span>
+                    <div key={j.job_id||i} style={{display:"flex",alignItems:"center",gap:5,padding:"3px 0",borderBottom:i<Math.min(apiJobs.length,8)-1?`1px solid ${C.border}`:"none"}}>
+                      <Dot color={j.status==="ready"?C.green:j.status==="failed"?C.red:C.opus} s={3}/>
+                      <span style={{fontFamily:mono,fontSize:8,color:C.muted,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{j.video_id} — {(j.message||"").slice(0,35)}</span>
                       <Tag color={j.status==="ready"?C.green:j.status==="failed"?C.red:C.opus}>{j.status}</Tag>
-                      <span style={{fontFamily:mono,fontSize:8,color:C.muted}}>{((j.progress||0)*100).toFixed(0)}%</span>
+                      <span style={{fontFamily:mono,fontSize:7,color:C.dim}}>{((j.progress||0)*100).toFixed(0)}%</span>
                     </div>
                   ))}
                 </div>
@@ -777,15 +777,15 @@ export default function CortexOS() {
                         <div key={i} style={{position:"relative",marginBottom:10,paddingLeft:12}}>
                           {/* Timeline dot */}
                           <div style={{position:"absolute",left:-13,top:6,width:8,height:8,borderRadius:"50%",
-                            background:c.severity==="high"?"#ff6b6b":c.severity==="medium"?"#fbbf24":"#94a3b8",
+                            background:c.severity==="high"?C.red:c.severity==="medium"?C.amber:C.dim,
                             border:`2px solid ${C.card}`,zIndex:1}}/>
 
                           <div style={{background:C.surface,border:`1px solid ${c.severity==="high"?`${C.red}50`:c.severity==="medium"?`${C.amber}40`:C.border}`,borderRadius:8,padding:12}}>
                             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-                              <Tag color={c.contradiction_type==="self_contradiction"?"#fbbf24":c.contradiction_type==="data_contradiction"?"#ff6b6b":"#c084fc"}>
+                              <Tag color={c.contradiction_type==="self_contradiction"?C.amber:c.contradiction_type==="data_contradiction"?C.red:C.purple}>
                                 {c.contradiction_type?.replace(/_/g," ")}
                               </Tag>
-                              <Tag color={c.severity==="high"?"#ff6b6b":c.severity==="medium"?"#fbbf24":"#94a3b8"}>{c.severity}</Tag>
+                              <Tag color={c.severity==="high"?C.red:c.severity==="medium"?C.amber:C.dim}>{c.severity}</Tag>
                             </div>
 
                             {/* Claim A */}

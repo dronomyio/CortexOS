@@ -1,0 +1,183 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// CortexOS API Integration Layer
+// Wires frontend to backend: /api/v1/* endpoints
+// ═══════════════════════════════════════════════════════════════════════════
+
+const API = "/api/v1";
+
+async function apiCall(path, opts = {}) {
+  const url = `${API}${path}`;
+  const headers = { "Content-Type": "application/json", ...opts.headers };
+  // Don't set Content-Type for FormData
+  if (opts.body instanceof FormData) delete headers["Content-Type"];
+  const res = await fetch(url, { ...opts, headers });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+// ── Health & Status ─────────────────────────────────────────────────────
+
+export async function fetchHealth() {
+  return apiCall("/health");
+}
+
+export async function fetchStatus() {
+  return apiCall("/status");
+}
+
+export async function fetchAgents() {
+  return apiCall("/agents");
+}
+
+export async function fetchMetrics() {
+  return apiCall("/metrics");
+}
+
+export async function fetchDebug() {
+  return apiCall("/debug");
+}
+
+// ── Jobs ────────────────────────────────────────────────────────────────
+
+export async function fetchJobs() {
+  return apiCall("/jobs");
+}
+
+export async function fetchJob(jobId) {
+  return apiCall(`/jobs/${jobId}`);
+}
+
+export async function fetchJobPlan(jobId) {
+  return apiCall(`/jobs/${jobId}/plan`);
+}
+
+// ── Ingest: Upload ──────────────────────────────────────────────────────
+
+export async function uploadVideo(file) {
+  const formData = new FormData();
+  formData.append("file", file);
+  return apiCall("/videos/upload", { method: "POST", body: formData });
+}
+
+// ── Ingest: URL ─────────────────────────────────────────────────────────
+
+export async function ingestUrl(url, title = null, startTime = null, endTime = null) {
+  return apiCall("/ingest/url", {
+    method: "POST",
+    body: JSON.stringify({ url, title, start_time: startTime, end_time: endTime }),
+  });
+}
+
+// ── Ingest: Batch URLs ──────────────────────────────────────────────────
+
+export async function ingestBatchUrls(urls) {
+  // urls: [{url, title?, start_time?, end_time?}, ...]
+  return apiCall("/ingest/urls", {
+    method: "POST",
+    body: JSON.stringify({ urls }),
+  });
+}
+
+// ── Ingest: Folder ──────────────────────────────────────────────────────
+
+export async function ingestFolder(folderPath) {
+  return apiCall(`/ingest/folder?folder=${encodeURIComponent(folderPath)}`, { method: "POST" });
+}
+
+// ── Search ──────────────────────────────────────────────────────────────
+
+export async function searchVideo(videoId, query, topK = 10, includeVisual = true) {
+  return apiCall(`/videos/${videoId}/search?q=${encodeURIComponent(query)}&top_k=${topK}&include_visual=${includeVisual}`);
+}
+
+export async function searchGlobal(query, mode = "hybrid", limit = 10) {
+  return apiCall(`/search?q=${encodeURIComponent(query)}&mode=${mode}&limit=${limit}`);
+}
+
+// ── Synthesize ──────────────────────────────────────────────────────────
+
+export async function synthesize(question, videoId = null, searchMode = "hybrid", topK = 8) {
+  return apiCall("/synthesize", {
+    method: "POST",
+    body: JSON.stringify({ question, video_id: videoId, search_mode: searchMode, top_k: topK }),
+  });
+}
+
+// ── Clips ───────────────────────────────────────────────────────────────
+
+export async function extractClip(videoId, t1, t2) {
+  return apiCall(`/videos/${videoId}/clip?t1=${t1}&t2=${t2}`);
+}
+
+export function clipDownloadUrl(clipName) {
+  return `${API}/clips/${clipName}`;
+}
+
+export function videoFileUrl(videoId) {
+  return `${API}/videos/${videoId}/file`;
+}
+
+// ── Agent Control ───────────────────────────────────────────────────────
+
+export async function startAgent(channels = "", interval = 300) {
+  return apiCall(`/agent/start?channels=${encodeURIComponent(channels)}&interval=${interval}`, { method: "POST" });
+}
+
+export async function stopAgent() {
+  return apiCall("/agent/stop", { method: "POST" });
+}
+
+export async function getAgentStatus() {
+  return apiCall("/agent/status");
+}
+
+export async function getAgentAlerts(severity = null, limit = 50) {
+  const params = new URLSearchParams({ limit });
+  if (severity) params.set("severity", severity);
+  return apiCall(`/agent/alerts?${params}`);
+}
+
+export async function triggerAnalysis() {
+  return apiCall("/agent/analyze", { method: "POST" });
+}
+
+// ── Eval ────────────────────────────────────────────────────────────────
+
+export async function fetchEval() {
+  return apiCall("/eval");
+}
+
+// ── Intelligence Layer ──────────────────────────────────────────────────
+
+export async function findContradictions(speakerFilter = "", topicFilter = "", maxVideos = 20, externalData = null) {
+  return apiCall("/contradictions/find", {
+    method: "POST",
+    body: JSON.stringify({
+      speaker_filter: speakerFilter,
+      topic_filter: topicFilter,
+      max_videos: maxVideos,
+      external_data: externalData,
+    }),
+  });
+}
+
+export async function contradictionStats() {
+  return apiCall("/contradictions/stats");
+}
+
+export async function speakerScorecard(speaker = "", maxVideos = 50) {
+  return apiCall("/speakers/scorecard", {
+    method: "POST",
+    body: JSON.stringify({ speaker, max_videos: maxVideos }),
+  });
+}
+
+export async function crossReference(question, externalData, speakerFilter = "") {
+  return apiCall("/intelligence/cross-reference", {
+    method: "POST",
+    body: JSON.stringify({ question, external_data: externalData, speaker_filter: speakerFilter }),
+  });
+}
