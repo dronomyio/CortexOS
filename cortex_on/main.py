@@ -205,6 +205,10 @@ class JobStatus(BaseModel):
     message: str
     created_at: str
     updated_at: str
+    source_url: Optional[str] = None
+    title: Optional[str] = None
+    opus_plan: Optional[Dict[str, Any]] = None
+    adaptive_analysis: Optional[List[Dict[str, Any]]] = None
 
 class SearchHit(BaseModel):
     text: str
@@ -380,107 +384,20 @@ async def _process_video(job_id: str, video_path: Path, video_id: str):
                  message=f"Step 4/5: Transcripts indexed ({elapsed}s). CLIP keyframes (Opus-selective)…",
                  updated_at=datetime.now(timezone.utc).isoformat())
 
-        # ── Step 4: Opus-Selective CLIP Keyframe Extraction ──────────────
+        # -- Step 4: CLIP Keyframe Extraction (SKIPPED - scripts not deployed) --
         all_keyframe_jsons: list[Path] = []
-
-        for i, seg in enumerate(segments):
-            # Check if Opus says to skip vision for this segment
-            if ingest_plans and i < len(ingest_plans):
-                plan = ingest_plans[i]
-                if not plan.vision_analysis:
-                    print(f"[Opus] Skipping CLIP for segment {i}: {plan.skip_reason}")
-                    continue
-
-            seg_idx = seg.get("index", i)
-            seg_video = seg.get("video_path", "")
-            seg_start = seg.get("start_seconds", 0.0)
-            seg_end = seg.get("end_seconds", 0.0)
-            frames_info = seg.get("frames", {})
-            frames_dir = frames_info.get("frames_dir", "")
-
-            if not seg_video or not Path(seg_video).exists():
-                continue
-
-            kf_json = vid_out / f"keyframes_seg_{seg_idx:03d}.json"
-
-            # Determine frame count based on Opus priority
-            k_frames = "4"
-            if ingest_plans and i < len(ingest_plans):
-                priority = ingest_plans[i].vision_priority
-                if priority == "high":
-                    k_frames = "6"
-                elif priority == "low":
-                    k_frames = "2"
-
-            kf_cmd = [
-                "python3", "/app/video_scripts/keyframes_describe.py",
-                "--out", str(kf_json),
-                "--fps", "1",
-                "--k", k_frames,
-                "--max-hamming", "6",
-                "--clip-id", f"{video_id}_seg{seg_idx}",
-                "--t1", str(seg_start),
-                "--t2", str(seg_end),
-                "--no-llm", "1",
-            ]
-
-            if frames_dir and Path(frames_dir).exists():
-                kf_cmd += ["--frames-dir", frames_dir]
-            else:
-                kf_cmd += ["--clip", seg_video]
-
-            r = await _run(kf_cmd)
-            if r.returncode == 0 and kf_json.exists():
-                all_keyframe_jsons.append(kf_json)
-
-        # ── Step 4b: Opus Adaptive Analysis (post-vision) ────────────────
         adaptive_results = []
-        if planner and ingest_plans:
-            for i, seg in enumerate(segments):
-                if i < len(ingest_plans) and ingest_plans[i].vision_analysis:
-                    kf_json = vid_out / f"keyframes_seg_{seg.get('index', i):03d}.json"
-                    if kf_json.exists():
-                        try:
-                            kf_data = json.loads(kf_json.read_text())
-                            analysis = await planner.analyze_segment_deep(
-                                transcript=seg.get("transcript", ""),
-                                vision_output={"keyframes": kf_data.get("keyframes", [])},
-                                video_id=video_id,
-                                start_seconds=seg.get("start_seconds", 0),
-                                end_seconds=seg.get("end_seconds", 0),
-                            )
-                            if analysis.discrepancies or analysis.risk_score > 0.5:
-                                adaptive_results.append({
-                                    "segment": i,
-                                    "risk_score": analysis.risk_score,
-                                    "discrepancies": analysis.discrepancies,
-                                    "claims_to_verify": analysis.claims_to_verify,
-                                })
-                                print(f"[Opus] Segment {i}: risk={analysis.risk_score}, "
-                                      f"discrepancies={len(analysis.discrepancies)}")
-                        except Exception as e:
-                            print(f"[Opus] Adaptive analysis failed for segment {i}: {e}")
+        print(f"[VideoIngest] Skipping CLIP keyframes + adaptive analysis (scripts not available)")
 
         j["adaptive_analysis"] = adaptive_results
 
         elapsed = int(time.time() - t0)
         j.update(progress=0.85,
-                 message=f"Step 5/5: CLIP done ({len(all_keyframe_jsons)} segments). Indexing visuals ({elapsed}s)…",
+                 message=f"Step 5/5: CLIP skipped. Indexing visuals ({elapsed}s)...",
                  updated_at=datetime.now(timezone.utc).isoformat())
 
-        # ── Step 5: Ingest Keyframes into Weaviate ───────────────────────
+        # -- Step 5: Ingest Keyframes into Weaviate (skipped - no keyframes) --
         kf_ingested = 0
-        for kf_json in all_keyframe_jsons:
-            clip_id = kf_json.stem
-            r = await _run([
-                "python3", "/app/video_scripts/weaviate_ingest_keyframes.py",
-                "--json", str(kf_json),
-                "--video-id", video_id,
-                "--clip-id", clip_id,
-                "--collection", "VideoKeyframe",
-            ])
-            if r.returncode == 0:
-                kf_ingested += 1
 
         elapsed = int(time.time() - t0)
 
