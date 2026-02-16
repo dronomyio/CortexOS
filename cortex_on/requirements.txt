@@ -130,7 +130,7 @@ accelerate>=0.25.0
 huggingface-hub>=0.20.0
 
 # Perceptual hashing for keyframe dedup (optional, graceful fallback)
-imagehash>=4.3.0
+#imagehash>=4.3.0
 
 # Weaviate client v4 (may already be installed)
 #weaviate-client>=4.4.0
